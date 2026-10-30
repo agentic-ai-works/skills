@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# bwsafe - client. Hands every request to the locked-down `bwsafe` system user.
+# The vault, the unlocked session and the audit log live in that account; this script
+# runs as the caller. Only `run` and `reveal` bring a secret back here.
+set -euo pipefail
+# Linux: the core is root-owned in /opt/bwsafe and runs as the system user `bwsafe` (sudoers rule).
+# macOS Safer: same idea, as the hidden user _bwsafe. macOS Easy: the core runs as you, so no sudo.
+if [ "$(uname -s)" = Darwin ]; then
+  if [ -x /usr/local/libexec/bwsafe/bwsafe-core ]; then
+    CORE=/usr/local/libexec/bwsafe/bwsafe-core
+    core() { sudo -n -u _bwsafe "$CORE" "$@"; }
+  else
+    CORE="$HOME/Library/Application Support/bwsafe/bin/bwsafe-core"
+    core() { "$CORE" "$@"; }
+  fi
+  INSTALLER=install-macos.sh
+else
+  CORE=/opt/bwsafe/libexec/bwsafe-core
+  core() { sudo -n -u bwsafe "$CORE" "$@"; }
+  INSTALLER=install.sh
+fi
+if [ ! -x "$CORE" ]; then
+  echo "bwsafe: not installed. Jens must run once (a dialog explains it first): bash $(cd "$(dirname "$0")" && pwd)/../install/$INSTALLER" >&2
+  exit 3
+fi
+die() { echo "bwsafe: $1" >&2; exit "${2:-2}"; }
+
+case "${1:-}" in
+  run)
+    shift
+    pre=(); envvar=BW_SECRET; use_stdin=0
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+      case "$1" in
+        --env)   [ $# -ge 2 ] || die "option --env needs a value"; envvar="$2"; shift 2 ;;
+        --stdin) use_stdin=1; shift ;;
+        *)       pre+=("$1"); shift ;;
+      esac
+    done
+    [ "${1:-}" = "--" ] && [ $# -ge 2 ] || die "usage: bwsafe run [--field F] [--env VAR | --stdin] NAME [USER] -- CMD [ARGS...]"
+    shift
+    [[ "$envvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name: $envvar"
+    SECRET="$(core secret --purpose run ${pre[@]+"${pre[@]}"})" || exit $?
+    [ -n "$SECRET" ] || die "empty secret" 4
+    rc=0
+    if [ "$use_stdin" = 1 ]; then printf '%s\n' "$SECRET" | "$@" || rc=$?
+    else ( export "$envvar=$SECRET"; exec "$@" ) || rc=$?; fi
+    exit "$rc" ;;
+  reveal)
+    shift; yes=0; pre=()
+    for a in "$@"; do if [ "$a" = "--yes" ]; then yes=1; else pre+=("$a"); fi; done
+    [ "$yes" = 1 ] || die "reveal prints the secret into the chat transcript; add --yes only when the human explicitly asked to see it"
+    core secret --purpose reveal ${pre[@]+"${pre[@]}"}; echo ;;
+  secret) die "unknown command: secret (try: bwsafe help)" ;;
+  *) core "$@" ;;
+esac

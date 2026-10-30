@@ -1,0 +1,862 @@
+#!/usr/bin/env bash
+# bwsafe-core - Bitwarden access for an AI agent: passwords, usernames, notes and
+# authenticator (TOTP) codes/keys, limited by a policy the human ticks in dialogs.
+#
+# Uses the official `bw` CLI (rbw cannot write TOTP). bw is a large Node program that keeps
+# its session in an environment variable, so it never runs on the host: every call runs
+# inside a bubblewrap sandbox that
+#   * sees no home directory, no workspace, no ssh keys, no desktop session,
+#   * has no capabilities, its own PID/IPC/UTS/user namespaces,
+#   * gets only its own encrypted data dir and the network (to reach the server).
+# Secrets (session key, master password, API key, new passwords, TOTP seeds) reach the
+# sandbox over a private pipe (fd 3), never on a command line. bw's JSON is filtered inside
+# the sandbox with jq, so only what a command is allowed to show leaves it.
+#
+# Policy (set by the human with `bwsafe configure`, stored where the agent cannot write):
+#   actions  read / add / update / delete      (update and delete still ask every time)
+#   folders  everything, or: unfoldered entries and/or chosen folders
+#   secrets  passwords+usernames+notes, and/or authenticator codes+keys
+# Only login entries are ever reachable; cards, identities and secure notes are not.
+#
+# This file is the CORE. It is installed root-owned at /opt/bwsafe/libexec/bwsafe-core and
+# runs only as the locked-down system user `bwsafe` (via the `bwsafe` client and one sudoers
+# rule), so the agent's own account cannot read the vault, the session key, the policy or the
+# audit log, edit this script, or call bw directly. It trusts nothing from the caller's
+# environment: every path and setting below is fixed by the installer.
+set -euo pipefail
+set +x
+unset BASH_ENV ENV CDPATH IFS LD_PRELOAD LD_LIBRARY_PATH 2>/dev/null || true
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+umask 077
+
+# --- CONFIG (rewritten by install-root.sh; do not read these from the environment) ---
+BW_BIN="/opt/bwsafe/bin/bw"
+STATE="/var/lib/bwsafe"
+RUN="/run/bwsafe"
+export DISPLAY=":1"
+export GDK_BACKEND=x11   # dialogs go through X11/XWayland, which also works on Wayland desktops
+ZENITY="/usr/bin/zenity"
+TLS_CHECK=1              # probe a self-hosted server's certificate at setup (tests switch it off)
+# macOS (the Linux installer leaves these as they are):
+SANDBOX="bwrap"          # bwrap (Linux) | seatbelt (macOS: sandbox-exec)
+UI_MODE="zenity"         # zenity (Linux) | direct (macOS Easy: osascript as the user) | socket (macOS Safer: the user's dialog helper)
+PYTHON="/usr/bin/python3"
+UI_HELPER=""             # path of bwsafe-ui.py
+UI_SOCK=""               # the helper's socket (UI_MODE=socket)
+SB_PROFILE=""            # path of bwsafe.sb (SANDBOX=seatbelt)
+JQ_BIN=""                # absolute path of jq when it is not in /usr/bin (macOS with Homebrew)
+# --- END CONFIG ---
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "bwsafe: needs bash 4 or newer (on macOS: brew install bash)" >&2; exit 3; }
+JQ_DIR=""; [ -n "$JQ_BIN" ] && { JQ_DIR="$(dirname "$JQ_BIN")"; PATH="$PATH:$JQ_DIR"; }
+OS="$(uname -s)"
+
+DATA="$STATE/bwdata"
+EXTRA_CA="$STATE/extra-ca.pem"
+POLICY_FILE="$STATE/policy.json"
+AUDIT_LOG="$STATE/audit.log"
+SESSION_FILE="$RUN/session"
+SYNC_STAMP="$RUN/sync.stamp"
+SESSION_TTL=86400
+DEFAULT_FOLDER="OpenClaw"
+EU_SERVER="https://vault.bitwarden.eu"
+US_SERVER="https://vault.bitwarden.com"
+APPROVE_SECONDS=120
+NAME=""; USER_=""
+# jq helpers used inside the sandbox: pol = the policy, inscope = entry is in an allowed folder
+JQDEFS='def pol: (env.POLICY | fromjson); def inscope: (pol as $p | $p.all or ((.folderId == null) and $p.nofolder) or (.folderId as $f | ($p.folderIds | any(. == $f))));'
+
+die()  { printf 'bwsafe: %s\n' "$1" >&2; exit "${2:-2}"; }
+info() { printf 'bwsafe: %s\n' "$1" >&2; }
+
+usage() {
+cat <<'EOF'
+bwsafe - Bitwarden for agents: passwords, usernames and authenticator codes, within the
+permissions the human ticked (bwsafe configure). bw runs as a locked-down user in a sandbox.
+
+Read:
+  status                         login, session age, sandbox, current permissions
+  list [--folder F]              NAME / USER / FOLDER / KEY of the entries you may see
+  search QUERY                   same, filtered by QUERY
+  fields NAME [USER]             which fields an entry has (names only)
+  user NAME [USER]               the username of an entry
+  code NAME [USER]               current authenticator code (6 digits, 30 s lifetime)
+  run [--field F] [--env VAR | --stdin] NAME [USER] -- CMD [ARGS...]
+                                 run CMD with the secret in $VAR (default BW_SECRET) or on its stdin
+  reveal NAME [USER] [--field F] --yes     print a secret into the chat (last resort)
+
+Add (never overwrites; new entries go to folder "OpenClaw" unless --folder F / --no-folder):
+  generate NAME [USER] [--len N | --words N] [--uri U] [--folder F]
+                                 new entry with a random password, never shown
+  add NAME [USER] [--uri U] [--notes TEXT] [--folder F] --stdin | --prompt
+                                 store a password/secret (--stdin: piped in; --prompt: the human types it)
+  addkey NAME [USER] [--folder F] --stdin | --prompt
+                                 add an authenticator key (base32 secret or otpauth:// URI);
+                                 attaches to an existing entry that has none
+
+Update / delete (the human clicks Approve in a dialog each time):
+  edit NAME [USER] --stdin | --prompt     replace the password
+  setkey NAME [USER] --stdin | --prompt   replace the authenticator key
+  rmkey NAME [USER]                       remove the authenticator key
+  remove NAME [USER]                      delete the entry (goes to the Bitwarden trash)
+
+Session and permissions:
+  setup [EMAIL] [--us | --eu | --server URL]   one-time: API-key login, unlock, permissions (dialogs);
+                                         without a flag a window asks: bitwarden.com, .eu or self-hosted
+  configure                      tick-box dialogs: actions, folders, passwords and/or TOTP
+  unlock | lock | sync | logout
+  log [N]                        last N audit lines (names only)
+  selftest                       check that the sandbox works and is closed (used by the installers)
+
+Exit codes: 3 locked/not set up, 4 not found or bw error, 5 not permitted by the policy,
+6 not approved, 7 already exists.
+EOF
+}
+
+# ---------- audit ----------
+audit() {
+  ( umask 077; mkdir -p "$STATE"
+    printf '%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)""${1//[[:cntrl:]]/ }" "${NAME//[[:cntrl:]]/ }" "${USER_//[[:cntrl:]]/ }" >> "$AUDIT_LOG"
+  ) 2>/dev/null || true
+}
+
+# ---------- human dialogs (zenity, a GTK window on the X display) ----------
+# Not pinentry: on this host pinentry-x11 is the gnome3 one and needs the desktop's D-Bus,
+# which this user cannot reach. Only a clean OK click returns success; everything else
+# (Deny, close, timeout, crash, no display) counts as no.
+need_display() {
+  if [ "$UI_MODE" = zenity ]; then
+    [ -x "$ZENITY" ] || die "zenity is not installed, so dialogs are impossible" 6
+    [ -n "${DISPLAY:-}" ] || die "needs the desktop (DISPLAY is unset); the human must run this in a desktop terminal" 6
+  else
+    [ -x "$PYTHON" ] && [ -f "$UI_HELPER" ] || die "the dialog helper is missing (is bwsafe installed? python3 needed)" 6
+  fi
+}
+dlg_text() { printf '%s' "$1" | tr -d '\000-\010\013-\037'; }
+
+# tmo SECONDS CMD...: run with a time limit (macOS has no timeout; perl ships with it)
+tmo() {
+  local s="$1"; shift
+  if command -v timeout >/dev/null; then timeout "$s" "$@"
+  elif command -v gtimeout >/dev/null; then gtimeout "$s" "$@"
+  else perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"; fi
+}
+# mtime FILE: modification time, seconds since the epoch
+mtime() { if [ "$OS" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
+
+# ---------- dialogs ----------
+# Every dialog goes through ui_ask, which has one backend per platform. Only a clean positive
+# answer counts as yes; cancel, close, timeout, crash and no display all count as no.
+#   ui_ask KIND TITLE TEXT SECONDS [OK CANCEL HIDE]        entry | question
+#   ui_ask radio|checklist TITLE TEXT SECONDS OK CANCEL "" KEY LABEL STATE ...
+# Prints the typed text (entry) or the chosen keys, one per line (radio, checklist); rc 0 = yes.
+ui_ask() {
+  local kind="$1" title="$2" text="$3" secs="$4" ok="${5:-OK}" cancel="${6:-Cancel}" hide="${7:-0}" out rc=0
+  shift 7 2>/dev/null || shift $#
+  need_display
+  text="$(dlg_text "$text")"
+  if [ "$UI_MODE" = zenity ]; then
+    case "$kind" in
+      entry)
+        local hflag=(); [ "$hide" = 1 ] && hflag=(--hide-text)
+        out="$(tmo "$((secs + 5))" "$ZENITY" --entry "${hflag[@]}" --no-markup --width=520 --title="$title" --text="$text" --timeout="$secs" 2>/dev/null)" || rc=$?
+        [ "$rc" -eq 0 ] && printf '%s' "$out"; return "$rc" ;;
+      question)
+        tmo "$((secs + 5))" "$ZENITY" --question --no-markup --width=560 --title="$title" --text="$text" --ok-label="$ok" --cancel-label="$cancel" --timeout="$secs" >/dev/null 2>&1; return $? ;;
+      radio)
+        local rows=()
+        while [ $# -ge 3 ]; do rows+=("$3" "$1" "$2"); shift 3; done
+        out="$(tmo "$((secs + 5))" "$ZENITY" --list --radiolist --no-markup --width=620 --height=330 --title="$title" --text="$text" \
+          --column="" --column="Key" --column="What" --hide-column=2 --print-column=2 --ok-label="$ok" --timeout="$secs" "${rows[@]}" 2>/dev/null)" || rc=$?
+        [ "$rc" -eq 0 ] && printf '%s' "$out"; return "$rc" ;;
+      checklist)
+        local rows=()
+        while [ $# -ge 3 ]; do rows+=("$3" "$1" "$2"); shift 3; done
+        out="$(tmo "$((secs + 5))" "$ZENITY" --list --checklist --no-markup --width=680 --height=460 --title="$title" --text="$text" \
+          --column="Allow" --column="Key" --column="What" --hide-column=2 --print-column=2 --separator=$'\n' \
+          --ok-label="$ok" --timeout="$secs" "${rows[@]}" 2>/dev/null)" || rc=$?
+        [ "$rc" -eq 0 ] && printf '%s' "$out"; return "$rc" ;;
+    esac
+    return 1
+  fi
+  # macOS: JSON request to bwsafe-ui.py (direct = run it here; socket = ask the helper in the user's session)
+  local items='[]'
+  if [ "$kind" = radio ] || [ "$kind" = checklist ]; then
+    items="$(while [ $# -ge 3 ]; do printf '%s\t%s\t%s\n' "${1//$'\t'/ }" "${2//$'\t'/ }" "$3"; shift 3; done | jq -Rsc 'split("\n")|map(select(length>0)|split("\t")|{key:.[0],label:.[1],on:(.[2]=="TRUE")})')"
+  fi
+  local req resp
+  req="$(jq -nc --arg k "$kind" --arg t "$title" --arg x "$text" --argjson s "$secs" --arg ok "$ok" --arg c "$cancel" --arg h "$hide" --argjson i "$items" \
+        '{kind:$k,title:$t,text:$x,seconds:$s,ok:$ok,cancel:$c,hide:($h=="1"),items:$i}')"
+  if [ "$UI_MODE" = socket ]; then resp="$(printf '%s\n' "$req" | tmo "$((secs + 10))" "$PYTHON" -I "$UI_HELPER" client "$UI_SOCK" 2>/dev/null)" || return 1
+  else resp="$(printf '%s\n' "$req" | tmo "$((secs + 10))" "$PYTHON" -I "$UI_HELPER" ask 2>/dev/null)" || return 1; fi
+  [ "$(jq -r '.ok' <<<"$resp" 2>/dev/null)" = true ] || return 1
+  jq -j '.value|if type=="array" then join("\n") else (.//"") end' <<<"$resp"
+}
+
+# pin_get TITLE TEXT -> prints what the human typed (never logged)
+pin_get() {
+  local v rc=0
+  v="$(ui_ask entry "$1" "$2" 300 OK Cancel 1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "dialog cancelled or timed out" 6
+  [ -n "$v" ] || die "nothing was entered" 6
+  printf '%s' "$v"
+}
+
+# approve TEXT EVENT: fail-closed Approve/Deny dialog
+approve() {
+  local rc=0
+  need_display
+  info "waiting for approval on the desktop: $1"
+  ui_ask question "OpenClaw asks for your approval" "$1"$'\n\n'"Approve only if you asked for this." "$APPROVE_SECONDS" Approve Deny >/dev/null || rc=$?
+  if [ "$rc" -eq 0 ]; then audit "approved:$2"; return 0; fi
+  audit "denied:$2"
+  die "not approved (denied, timed out, or no dialog). Do not retry on your own; tell the human what you wanted to do and why" 6
+}
+
+# checklist TITLE TEXT KEY LABEL STATE [KEY LABEL STATE ...] -> selected keys, one per line
+checklist() {
+  local title="$1" text="$2" out rc=0
+  shift 2
+  out="$(ui_ask checklist "$title" "$text" 600 Next Cancel 0 "$@")" || rc=$?
+  [ "$rc" -eq 0 ] || die "dialog cancelled or timed out; nothing was changed" 6
+  printf '%s' "$out"
+}
+
+# ---------- sandbox ----------
+# box ENVLINES SCRIPT [ARGS...]
+#   Runs `sh -c SCRIPT` (with ARGS as $1..) inside bubblewrap. ENVLINES is one
+#   VAR=value per line and reaches the script as environment variables through fd 3.
+#   stdin and stdout pass through; `bw` and `jq` are on PATH inside.
+box() {
+  local envlines="$1" script="$2"; shift 2
+  [ -x "$BW_BIN" ] || die "bw CLI not found at $BW_BIN (is bwsafe installed?)" 3
+  ( umask 077; mkdir -p "$DATA" ) ; chmod 700 "$STATE" "$DATA" 2>/dev/null || true
+  if [ "$SANDBOX" = seatbelt ]; then box_seatbelt "$envlines" "$script" "$@"; return; fi
+  command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed" 3
+  # A certificate the human explicitly trusted for a self-hosted server (see trust_private_cert); absent for normal servers.
+  local CAARGS=()
+  [ -s "$EXTRA_CA" ] && CAARGS=(--ro-bind "$EXTRA_CA" /opt/extra-ca.pem --setenv NODE_EXTRA_CA_CERTS /opt/extra-ca.pem)
+  tmo 180 bwrap --die-with-parent --new-session --unshare-all --share-net --cap-drop ALL --clearenv "${CAARGS[@]}" \
+    --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+    --symlink usr/bin /bin --symlink usr/sbin /sbin \
+    --ro-bind /etc/ssl /etc/ssl --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
+    --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf --ro-bind /etc/hosts /etc/hosts \
+    --ro-bind-try /etc/resolv.conf /etc/resolv.conf \
+    --proc /proc --dev /dev --tmpfs /tmp --tmpfs /home/sandbox --dir /opt/bin \
+    --ro-bind "$BW_BIN" /opt/bin/bw --bind "$DATA" /data \
+    --setenv HOME /home/sandbox --setenv PATH /opt/bin:/usr/bin \
+    --setenv BITWARDENCLI_APPDATA_DIR /data --setenv BW_NOINTERACTION true \
+    sh -c 'while IFS= read -r l <&3 || [ -n "$l" ]; do case "$l" in *=*) export "$l";; esac; done; exec 3<&-; s=$1; shift; eval "$s"' sh "$script" "$@" \
+    3< <(printf '%s\n' "$envlines")
+}
+
+# macOS: the same idea with Apple's Seatbelt (sandbox-exec). Deny-by-default profile (bwsafe.sb): bw may read
+# system libraries, the CLI binaries and the certificate list, write only its data dir and a private temp dir,
+# and use the network. No home directory, no other files. Weaker than bubblewrap (no PID/IPC namespaces).
+box_seatbelt() {
+  local envlines="$1" script="$2"; shift 2
+  [ -f "$SB_PROFILE" ] || die "sandbox profile missing: $SB_PROFILE" 3
+  [ -x /usr/bin/sandbox-exec ] || die "sandbox-exec not found" 3
+  local tmpd="$STATE/tmp" jq_abs extra=() rc=0
+  ( umask 077; mkdir -p "$tmpd" )
+  jq_abs="$(command -v jq)" || die "jq is not installed" 3
+  [ -s "$EXTRA_CA" ] && extra=(NODE_EXTRA_CA_CERTS="$EXTRA_CA")
+  tmo 180 /usr/bin/sandbox-exec -f "$SB_PROFILE" -D "DATA=$DATA" -D "TMPD=$tmpd" -D "BW=$BW_BIN" -D "JQ=$jq_abs" -D "JQDIR=$(dirname "$jq_abs")" -D "EXTRACA=${EXTRA_CA}" \
+    /usr/bin/env -i HOME="$tmpd" TMPDIR="$tmpd" PATH="$(dirname "$BW_BIN"):$(dirname "$jq_abs"):/usr/bin:/bin" \
+      BITWARDENCLI_APPDATA_DIR="$DATA" BW_NOINTERACTION=true "${extra[@]}" \
+    /bin/sh -c 'while IFS= read -r l <&3 || [ -n "$l" ]; do case "$l" in *=*) export "$l";; esac; done; exec 3<&-; s=$1; shift; eval "$s"' sh "$script" "$@" \
+    3< <(printf '%s\n' "$envlines") || rc=$?
+  return "$rc"
+}
+
+# ---------- session ----------
+need_session() {
+  [ -s "$SESSION_FILE" ] || die "vault is locked; run: bwsafe unlock (the human types the master password)" 3
+  local age=$(( $(date +%s) - $(mtime "$SESSION_FILE") ))
+  if [ "$age" -ge "$SESSION_TTL" ]; then
+    rm -f "$SESSION_FILE"
+    die "session expired after $((SESSION_TTL / 3600)) h; run: bwsafe unlock" 3
+  fi
+  SESS="BW_SESSION=$(cat "$SESSION_FILE")"
+}
+
+# ---------- policy ----------
+POLICY=""
+load_policy() {
+  [ -n "$POLICY" ] && return 0
+  [ -s "$POLICY_FILE" ] || die "no permissions are set yet; the human must run: bwsafe configure (a few tick-box dialogs)" 5
+  POLICY="$(jq -c 'select(type == "object") | {read: (.read == true), add: (.add == true), update: (.update == true),
+      delete: (.delete == true), pwd: (.pwd == true), totp: (.totp == true), all: (.all == true), nofolder: (.nofolder == true),
+      folderIds: ((.folderIds // []) | map(tostring)), folderNames: ((.folderNames // []) | map(tostring))}' "$POLICY_FILE" 2>/dev/null)" || true
+  [ -n "$POLICY" ] || die "the permissions file is damaged; the human must run: bwsafe configure" 5
+}
+# gate PERM...: every listed permission must be switched on
+gate() {
+  local p; load_policy
+  for p in "$@"; do
+    jq -e --arg k "$p" '.[$k] == true' <<<"$POLICY" >/dev/null \
+      || die "not permitted: '$p' is switched off in the permissions. Only the human can change that (bwsafe configure)" 5
+  done
+}
+folder_in_scope() { # FOLDER_ID ("" = no folder)
+  jq -e --arg f "$1" '.all or (($f == "") and .nofolder) or (.folderIds | any(. == $f))' <<<"$POLICY" >/dev/null
+}
+policy_text() {
+  jq -r '"  actions : " + ([ (if .read then "read" else empty end), (if .add then "add" else empty end),
+                           (if .update then "update (each approved)" else empty end), (if .delete then "delete (each approved)" else empty end) ]
+                         | if length == 0 then "none" else join(", ") end),
+         "  folders : " + (if .all then "every folder and entries without a folder"
+                           else ([ (if .nofolder then "entries without a folder" else empty end), (.folderNames[]?) ]
+                                 | if length == 0 then "none" else join(", ") end) end),
+         "  secrets : " + ([ (if .pwd then "passwords, usernames, notes" else empty end), (if .totp then "authenticator codes and keys" else empty end) ]
+                         | if length == 0 then "none" else join(", ") end)' <<<"$1"
+}
+
+# bwv SCRIPT [ARGS]  /  bwv_env EXTRA SCRIPT [ARGS]   : session only
+# bwp SCRIPT [ARGS]  /  bwp_env EXTRA SCRIPT [ARGS]   : session + policy (for scripts that filter by scope)
+bwv()     { need_session; box "$SESS" "$@"; }
+bwv_env() { local extra="$1"; shift; need_session; box "$SESS"$'\n'"$extra" "$@"; }
+bwp()     { need_session; load_policy; box "$SESS"$'\n'"POLICY=$POLICY"$'\n'"JQDEFS=$JQDEFS" "$@"; }
+bwp_env() { local extra="$1"; shift; need_session; load_policy; box "$SESS"$'\n'"POLICY=$POLICY"$'\n'"JQDEFS=$JQDEFS"$'\n'"$extra" "$@"; }
+
+maybe_sync() {
+  local now; now=$(date +%s)
+  if [ -f "$SYNC_STAMP" ] && [ $(( now - $(mtime "$SYNC_STAMP") )) -lt 300 ]; then return 0; fi
+  bwv 'bw sync >/dev/null' || die "sync failed" 4
+  ( umask 077; mkdir -p "$RUN"; : > "$SYNC_STAMP" )
+}
+
+# ---------- argument parsing ----------
+parse() {
+  NAME=""; USER_=""; MODE=""; FOLDER="$DEFAULT_FOLDER"; FOLDER_SET=0; NEWNOFOLDER=0
+  FIELD=""; LEN=""; WORDS=""; URI=""; NOTES=""; PURPOSE=""
+  local pos=() v
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stdin) MODE=stdin ;;
+      --prompt) MODE=prompt ;;
+      --no-folder) NEWNOFOLDER=1 ;;
+      --folder)  [ $# -ge 2 ] || die "--folder needs a value"; FOLDER="$2"; FOLDER_SET=1; shift ;;
+      --field)   [ $# -ge 2 ] || die "--field needs a value"; FIELD="$2"; shift ;;
+      --len)     [ $# -ge 2 ] || die "--len needs a value"; LEN="$2"; shift ;;
+      --words)   [ $# -ge 2 ] || die "--words needs a value"; WORDS="$2"; shift ;;
+      --uri)     [ $# -ge 2 ] || die "--uri needs a value"; URI="$2"; shift ;;
+      --notes)   [ $# -ge 2 ] || die "--notes needs a value"; NOTES="$2"; shift ;;
+      --purpose) [ $# -ge 2 ] || die "--purpose needs a value"; PURPOSE="$2"; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) pos+=("$1") ;;
+    esac; shift
+  done
+  [ "${#pos[@]}" -le 2 ] || die "too many arguments (NAME [USER])"
+  NAME="${pos[0]:-}"; USER_="${pos[1]:-}"
+  for v in "$NAME" "$USER_" "$FOLDER" "$URI" "$FIELD"; do
+    [[ "$v" != *[[:cntrl:]]* ]] || die "control characters are not allowed in names, folders, URLs or fields"
+  done
+  NOTES="${NOTES//[[:cntrl:]]/ }"
+  PURPOSE="${PURPOSE//[^a-z]/}"
+}
+need_name() { [ -n "$NAME" ] || die "an entry NAME is required (try: bwsafe list)"; }
+
+# read_secret -> PW (a single line). Never echoed.
+read_secret() {
+  local raw=""
+  case "$MODE" in
+    stdin)  IFS= read -r raw || true ;;
+    prompt) raw="$(pin_get "OpenClaw: secret for the vault" "OpenClaw asks you to type the password/secret for the Bitwarden entry:"$'\n\n'"    $NAME${USER_:+ ($USER_)}"$'\n\n'"It goes straight into your vault; OpenClaw never sees it.")" ;;
+    *) die "give the secret with --stdin (pipe it in) or --prompt (the human types it)" ;;
+  esac
+  [ -n "$raw" ] || die "the secret is empty"
+  PW="$raw"
+}
+
+# read_seed -> SEED (validated, normalised). Never echoed.
+read_seed() {
+  local raw=""
+  case "$MODE" in
+    stdin)  IFS= read -r raw || true ;;
+    prompt) raw="$(pin_get "OpenClaw: authenticator key" "OpenClaw asks you to type the authenticator key (base32 secret or otpauth:// link) for:"$'\n\n'"    $NAME${USER_:+ ($USER_)}"$'\n\n'"It goes straight into your vault; OpenClaw never sees it.")" ;;
+    *) die "give the key with --stdin (pipe it in) or --prompt (the human types it)" ;;
+  esac
+  raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  if [[ "$raw" =~ ^otpauth://totp/[^[:space:]]+$ && "$raw" == *secret=* ]]; then SEED="$raw"
+  elif [[ "$raw" =~ ^steam://[A-Za-z2-7]+$ ]]; then SEED="$raw"
+  else
+    raw="${raw^^}"
+    [[ "$raw" =~ ^[A-Z2-7]{8,}=*$ ]] || die "that does not look like a TOTP key (expected a base32 secret or an otpauth:// URI)"
+    SEED="$raw"
+  fi
+}
+
+# ---------- scripts that run inside the sandbox ----------
+S_FIND=$(cat <<'EOF'
+bw list items --search "$1" | jq -r --arg n "$1" --arg u "$2" "$JQDEFS"' .[]
+  | select(.type == 1 and inscope and .name == $n and ($u == "" or .login.username == $u))
+  | [.id, ((.login.totp // "") != ""), (.folderId // "")] | @tsv'
+EOF
+)
+S_LIST=$(cat <<'EOF'
+bw list folders > /tmp/f.json
+bw list items | jq -r --slurpfile f /tmp/f.json "$JQDEFS"' ($f[0] | map(select(.id != null) | {key: .id, value: .name}) | from_entries) as $m
+  | .[] | select(.type == 1 and inscope)
+  | (if .folderId == null then "-" else ($m[.folderId] // "?") end) as $fn
+  | select((env.ONLY_FOLDER // "") == "" or $fn == env.ONLY_FOLDER)
+  | [.name, (.login.username // ""), $fn, (if pol.totp then (if ((.login.totp // "") != "") then "yes" else "-" end) else "n/a" end)] | @tsv'
+EOF
+)
+S_SEARCH=$(cat <<'EOF'
+bw list folders > /tmp/f.json
+bw list items --search "$1" | jq -r --slurpfile f /tmp/f.json "$JQDEFS"' ($f[0] | map(select(.id != null) | {key: .id, value: .name}) | from_entries) as $m
+  | .[] | select(.type == 1 and inscope)
+  | (if .folderId == null then "-" else ($m[.folderId] // "?") end) as $fn
+  | [.name, (.login.username // ""), $fn, (if pol.totp then (if ((.login.totp // "") != "") then "yes" else "-" end) else "n/a" end)] | @tsv'
+EOF
+)
+S_FIELDS=$(cat <<'EOF'
+bw get item "$1" | jq -r "$JQDEFS"' [ (if (.login.username // "") != "" then "username" else empty end),
+  (if (.login.password // "") != "" then "password" else empty end),
+  (if ((.login.uris // []) | length) > 0 then "uris" else empty end),
+  (if (.notes // "") != "" then "notes" else empty end),
+  (if pol.totp and ((.login.totp // "") != "") then "totp" else empty end),
+  (.fields[]?.name) ] | .[]'
+EOF
+)
+S_GET=$(cat <<'EOF'
+case "$2" in
+  password) bw get password "$1" ;;
+  username) bw get username "$1" ;;
+  notes)    bw get notes "$1" ;;
+  uris|uri) bw get uri "$1" ;;
+  totp)     bw get totp "$1" ;;
+  *)        bw get item "$1" | jq -j --arg n "$2" '.fields[]? | select(.name == $n) | .value // empty' ;;
+esac
+EOF
+)
+S_FOLDER_FIND=$(cat <<'EOF'
+bw list folders | jq -r '.[] | select(.id != null and .name == env.FOLDER_NAME) | .id' | head -n1
+EOF
+)
+S_FOLDER_ENSURE=$(cat <<'EOF'
+id=$(bw list folders | jq -r '.[] | select(.id != null and .name == env.FOLDER_NAME) | .id' | head -n1)
+if [ -z "$id" ]; then
+  id=$(jq -nc '{name: env.FOLDER_NAME}' | bw encode | bw create folder | jq -r .id)
+fi
+printf '%s' "$id"
+EOF
+)
+S_CREATE=$(cat <<'EOF'
+jq -nc '{type: 1, name: env.ITEM_NAME, notes: (if env.ITEM_NOTES == "" then null else env.ITEM_NOTES end), favorite: false, reprompt: 0, fields: [],
+         folderId: (if env.FOLDER_ID == "" then null else env.FOLDER_ID end),
+         login: {username: (if env.ITEM_USER == "" then null else env.ITEM_USER end),
+                 password: (if env.ITEM_PW == "" then null else env.ITEM_PW end),
+                 totp: (if env.TOTP_SEED == "" then null else env.TOTP_SEED end),
+                 uris: (if env.ITEM_URI == "" then [] else [{match: null, uri: env.ITEM_URI}] end)}}' \
+  | bw encode | bw create item >/dev/null
+EOF
+)
+S_SETPW=$(cat <<'EOF'
+bw get item "$1" | jq -c '.login.password = env.NEW_PW' | bw encode | bw edit item "$1" >/dev/null
+EOF
+)
+S_SETKEY=$(cat <<'EOF'
+bw get item "$1" | jq -c '.login.totp = env.TOTP_SEED' | bw encode | bw edit item "$1" >/dev/null
+EOF
+)
+S_CLEARKEY=$(cat <<'EOF'
+bw get item "$1" | jq -c '.login.totp = null' | bw encode | bw edit item "$1" >/dev/null
+EOF
+)
+
+# ---------- item lookup ----------
+# find_item: sets ITEM_COUNT, ITEM_ID, ITEM_HAS (true/false), ITEM_FOLDER. Exact name (and user if given), only inside the policy scope.
+find_item() {
+  local rows
+  maybe_sync
+  rows="$(bwp "$S_FIND" "$NAME" "$USER_")" || die "bw failed" 4
+  ITEM_COUNT=0; ITEM_ID=""; ITEM_HAS=""; ITEM_FOLDER=""
+  [ -n "$rows" ] && ITEM_COUNT="$(printf '%s\n' "$rows" | wc -l)"
+  if [ "$ITEM_COUNT" -eq 1 ]; then IFS=$'\t' read -r ITEM_ID ITEM_HAS ITEM_FOLDER <<<"$rows"; fi
+  return 0
+}
+require_item() {
+  need_name; find_item
+  [ "$ITEM_COUNT" -ge 1 ] || die "no entry named '$NAME'${USER_:+ for user '$USER_'} that you may use (try: bwsafe search)" 4
+  [ "$ITEM_COUNT" -eq 1 ] || die "$ITEM_COUNT entries match '$NAME'; add the USER argument" 4
+}
+# resolve_folder: sets FID for a NEW entry and checks the policy allows that folder
+resolve_folder() {
+  FID=""
+  if [ "$NEWNOFOLDER" -eq 1 ]; then :
+  elif [ "$FOLDER" = "$DEFAULT_FOLDER" ]; then
+    FID="$(bwv_env "FOLDER_NAME=$FOLDER" "$S_FOLDER_ENSURE")" || die "folder lookup failed" 4
+  else
+    FID="$(bwv_env "FOLDER_NAME=$FOLDER" "$S_FOLDER_FIND")" || die "folder lookup failed" 4
+    [ -n "$FID" ] || die "no folder named '$FOLDER' exists" 4
+  fi
+  folder_in_scope "$FID" || die "not permitted: new entries may not go ${NEWNOFOLDER:+without a folder}${NEWNOFOLDER:+}$([ "$NEWNOFOLDER" -eq 1 ] || printf 'into the folder %s' "$FOLDER") under the current permissions (bwsafe configure changes that; --folder F picks an allowed one)" 5
+}
+create_item() { # uses PW, SEED (may be empty), FID, NAME, USER_, URI, NOTES
+  bwv_env "ITEM_NAME=$NAME"$'\n'"ITEM_USER=$USER_"$'\n'"ITEM_PW=${PW:-}"$'\n'"ITEM_URI=$URI"$'\n'"ITEM_NOTES=$NOTES"$'\n'"TOTP_SEED=${SEED:-}"$'\n'"FOLDER_ID=$FID" "$S_CREATE" || die "bw failed" 4
+}
+
+# ---------- commands: session ----------
+cmd_status() {
+  echo "bw:      $([ -x "$BW_BIN" ] && "$BW_BIN" --version 2>/dev/null || echo missing) ($BW_BIN)"
+  if [ "$SANDBOX" = seatbelt ]; then echo "sandbox: macOS Seatbelt (sandbox-exec), profile ${SB_PROFILE:-missing}"
+  else echo "sandbox: $(command -v bwrap >/dev/null && bwrap --version || echo 'bwrap missing')"; fi
+  if [ "$UI_MODE" = zenity ]; then echo "display: ${DISPLAY:-none}   (dialogs need this)"; else echo "dialogs: $UI_MODE via ${UI_HELPER:-missing}"; fi
+  if [ -s "$SESSION_FILE" ]; then
+    local age=$(( $(date +%s) - $(mtime "$SESSION_FILE") ))
+    if [ "$age" -ge "$SESSION_TTL" ]; then echo "session: expired"; rm -f "$SESSION_FILE"
+    else echo "session: unlocked, $(( (SESSION_TTL - age) / 60 )) min left"; fi
+  else echo "session: locked"; fi
+  box "" 'bw status' 2>/dev/null | jq -r '"login:   \(.status)   server: \(.serverUrl // "default")  (\"locked\" here only means no session; trust the line above)"' 2>/dev/null || echo "login:   unknown"
+  [ -s "$EXTRA_CA" ] && echo "trusted private certificate: yes (chosen by the human at setup)"
+  if [ -s "$POLICY_FILE" ]; then load_policy; echo "permissions:"; policy_text "$POLICY"
+  else echo "permissions: not set (the human runs: bwsafe configure)"; fi
+}
+
+# valid_server URL: https only (http only for a local test server); no credentials, query or spaces
+valid_server() {
+  [[ "$1" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] && return 0
+  [[ "$1" =~ ^http://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] && return 0
+  return 1
+}
+
+# choose_server -> prints the server URL the human picked (dialog)
+choose_server() {
+  local pick url rc=0
+  pick="$(ui_ask radio "OpenClaw Bitwarden setup - which Bitwarden?" "Which Bitwarden server holds your vault?" 300 Next Cancel 0 \
+    us "bitwarden.com (US cloud)" TRUE eu "bitwarden.eu (EU cloud)" FALSE self "Self-hosted (Vaultwarden or official self-host): I type the address" FALSE)" || rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$pick" ] || die "no server chosen" 6
+  case "$pick" in
+    us) printf '%s' "$US_SERVER" ;;
+    eu) printf '%s' "$EU_SERVER" ;;
+    self)
+      url="$(ui_ask entry "OpenClaw Bitwarden setup - self-hosted address" "Address of your server, for example https://vault.example.com  (https only; http is accepted only for localhost)." 300 OK Cancel 0)" || die "no address entered" 6
+      url="${url%/}"
+      printf '%s' "$url" ;;
+    *) die "bad choice" 6 ;;
+  esac
+}
+
+# tls_probe URL [CAFILE] -> curl's exit code (0 ok, 60 certificate not trusted, 6/7 unreachable)
+tls_probe() { box "" 'curl -sS -o /dev/null --max-time 20 ${2:+--cacert "$2"} "$1" 2>/dev/null' "$1" "${2:-}"; }
+
+# trust_private_cert URL: if the server's certificate is not trusted by the system (self-signed or a
+# private CA), show it to the human and, only if they agree, trust exactly that certificate for the sandbox.
+trust_private_cert() {
+  local server="$1" rc=0 hostport host chain top info subj iss fp isca rc2=0
+  case "$server" in https://*) ;; *) return 0 ;; esac
+  [ "$TLS_CHECK" = 1 ] || return 0
+  tls_probe "$server" || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 60 ] || [ "$rc" -eq 35 ] || die "cannot reach $server (network or address problem, curl exit $rc)" 4
+  hostport="${server#https://}"; hostport="${hostport%%/*}"; host="${hostport%%:*}"
+  [[ "$hostport" == *:* ]] || hostport="$hostport:443"
+  chain="$(box "" 'openssl s_client -connect "$1" ${2:+-servername "$2"} -showcerts </dev/null 2>/dev/null' "$hostport" "$([[ "$host" =~ ^[0-9.]+$ ]] || printf '%s' "$host")")" || true
+  top="$(printf '%s\n' "$chain" | awk '/-----BEGIN CERTIFICATE-----/{b=""} {b=b $0 "\n"} /-----END CERTIFICATE-----/{last=b} END{printf "%s", last}')"
+  [ -n "$top" ] || die "the server's certificate is not trusted and could not be read" 4
+  info="$(printf '%s' "$top" | box "" 'openssl x509 -noout -subject -issuer -dates -fingerprint -sha256 2>/dev/null')" || die "could not read the certificate" 4
+  subj="$(sed -n 's/^subject= *//p' <<<"$info")"; iss="$(sed -n 's/^issuer= *//p' <<<"$info")"
+  fp="$(sed -n 's/^.*Fingerprint=//p' <<<"$info")"
+  [ -n "$fp" ] || die "could not read the certificate fingerprint" 4
+  [ "$subj" = "$iss" ] || die "the server uses a private CA but does not send that CA's certificate, so it cannot be trusted automatically. Make the server send its full chain (for example fullchain.pem), or use a certificate from a public CA such as Let's Encrypt." 4
+  isca=""; printf '%s' "$top" | box "" 'openssl x509 -noout -text 2>/dev/null' | grep -q 'CA:TRUE' && isca="
+WARNING: this certificate is marked as a certificate authority, so it could vouch for ANY website, not only your server. Trust it only if you control it."
+  rc2=0
+  ui_ask question "OpenClaw Bitwarden setup - trust this server's certificate?" "$server uses a certificate that this computer does not trust (it is self-signed or from a private authority).
+
+Subject:  $subj
+Valid:    $(sed -n 's/^notBefore=//p' <<<"$info") to $(sed -n 's/^notAfter=//p' <<<"$info")
+SHA-256:  $fp
+$isca
+Trust it only if this is YOUR server and the fingerprint matches the one on the server. It is accepted only by OpenClaw's Bitwarden helper, only for the sandbox; the rest of the system is unchanged." 300 "Trust it" Cancel >/dev/null || rc2=$?
+  [ "$rc2" -eq 0 ] || die "certificate not trusted; setup cancelled" 6
+  ( umask 077; printf '%s' "$top" > "$EXTRA_CA.tmp" && mv "$EXTRA_CA.tmp" "$EXTRA_CA" )
+  rc=0; tls_probe "$server" "$([ "$SANDBOX" = seatbelt ] && printf '%s' "$EXTRA_CA" || printf '/opt/extra-ca.pem')" || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$EXTRA_CA"; die "that certificate does not validate this server (curl exit $rc), so it was not trusted" 4; fi
+  audit "trust-cert:$fp"
+  info "trusted certificate $fp for $server"
+}
+
+cmd_setup() {
+  local server="" email=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --eu) [ -z "$server" ] || die "--us, --eu and --server are exclusive"; server="$EU_SERVER" ;;
+      --us) [ -z "$server" ] || die "--us, --eu and --server are exclusive"; server="$US_SERVER" ;;
+      --server) [ $# -ge 2 ] || die "--server needs a URL"; [ -z "$server" ] || die "--us, --eu and --server are exclusive"; server="${2%/}"; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) email="$1" ;;
+    esac; shift
+  done
+  local st; st="$(box "" 'bw status' | jq -r .status)"
+  if [ "$st" = "unauthenticated" ]; then
+    [ -n "$server" ] || server="$(choose_server)"
+    valid_server "$server" || die "not a usable server address: '$server' (use https://host[:port][/path])" 2
+    info "server: $server${email:+   account: $email}"
+    rm -f "$EXTRA_CA"   # a certificate trusted for an earlier server never carries over
+    trust_private_cert "$server"
+    box "" 'bw config server "$1" >/dev/null' "$server" || die "could not set the server" 4
+    local cid csec
+    cid="$(pin_get "OpenClaw Bitwarden setup - step 1 of 4" "One-time login for OpenClaw's Bitwarden helper (it runs as the locked-down system user 'bwsafe').
+
+Enter your personal API key's client_id. You find it in your web vault ($server): Settings > Security > Keys > View API key. It looks like: user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+
+OpenClaw cannot see what you type.")"
+    csec="$(pin_get "OpenClaw Bitwarden setup - step 2 of 4" "Now the client_secret of the same personal API key (same page: View API key).
+
+It is stored encrypted for the 'bwsafe' user only. OpenClaw cannot see it.")"
+    [[ "$cid" != *$'\n'* && "$csec" != *$'\n'* ]] || die "bad input"
+    box "BW_CLIENTID=$cid"$'\n'"BW_CLIENTSECRET=$csec" 'bw login --apikey >/dev/null' || die "API-key login failed" 4
+    cid=""; csec=""
+  else
+    info "already logged in on this machine; skipping the API-key steps"
+  fi
+  audit "setup"
+  cmd_unlock "OpenClaw Bitwarden setup - step 3 of 4"
+  cmd_configure "OpenClaw Bitwarden setup - step 4 of 4: what may OpenClaw do?"
+}
+
+cmd_unlock() {
+  local pw key
+  pw="$(pin_get "${1:-OpenClaw: unlock Bitwarden}" "OpenClaw's Bitwarden helper wants to unlock your vault for $((SESSION_TTL / 3600)) hours.
+
+Type your Bitwarden master password. It is used once to unlock, is not stored, and OpenClaw cannot see it. What OpenClaw may do afterwards is limited by the permissions you set ('bwsafe configure').")"
+  [[ "$pw" != *$'\n'* ]] || die "bad input"
+  key="$(box "BW_PASSWORD=$pw" 'bw unlock --passwordenv BW_PASSWORD --raw')" || die "unlock failed (wrong master password, or not logged in: run bwsafe setup)" 4
+  pw=""
+  [[ -n "$key" && "$key" != *[[:space:]]* ]] || die "unlock gave no session key" 4
+  ( umask 077; mkdir -p "$RUN"; printf '%s' "$key" > "$SESSION_FILE" )
+  key=""
+  audit "unlock"
+  bwv 'bw sync >/dev/null' && ( : > "$SYNC_STAMP" ) || true
+  info "unlocked; the session expires in $((SESSION_TTL / 3600)) h"
+}
+
+cmd_lock()   { rm -f "$SESSION_FILE" "$SYNC_STAMP"; box "" 'bw lock >/dev/null' 2>/dev/null || true; audit "lock"; info "locked"; }
+cmd_logout() { rm -f "$SESSION_FILE" "$SYNC_STAMP" "$EXTRA_CA"; box "" 'bw logout >/dev/null' || die "logout failed" 4; audit "logout"; info "logged out"; }
+cmd_sync()   { rm -f "$SYNC_STAMP"; maybe_sync; info "synced"; }
+
+# ---------- commands: permissions ----------
+cmd_configure() {
+  local title="${1:-OpenClaw Bitwarden permissions}" ocid folders cur SEL
+  need_session
+  ocid="$(bwv_env "FOLDER_NAME=$DEFAULT_FOLDER" "$S_FOLDER_ENSURE")" || die "could not prepare the $DEFAULT_FOLDER folder" 4
+  folders="$(bwv 'bw list folders' | jq -c '[.[] | select(.id != null) | {id, name}]')" || die "could not read the folder list" 4
+  if [ -s "$POLICY_FILE" ]; then POLICY=""; load_policy; cur="$POLICY"
+  else cur="$(jq -nc --arg oc "$ocid" '{read: true, add: true, update: false, delete: false, pwd: true, totp: false, all: false, nofolder: false, folderIds: [$oc], folderNames: []}')"; fi
+  local st; st() { jq -r --arg k "$1" 'if .[$k] == true then "TRUE" else "FALSE" end' <<<"$cur"; }
+  picked() { printf '%s\n' "$SEL" | grep -qxF -- "$1"; }
+
+  SEL="$(checklist "$title" "What may OpenClaw do in your Bitwarden vault?
+
+Tick the actions to allow. Update and Delete still ask you to click Approve every single time." \
+    read   "Read: list and search entries, and use passwords / codes (what exactly: see the last question)" "$(st read)" \
+    add    "Add: create new entries. Never overwrites anything" "$(st add)" \
+    update "Update: change a password or authenticator key (you approve each change)" "$(st update)" \
+    delete "Delete: delete entries or remove keys (you approve each deletion)" "$(st delete)")"
+  local R=false A=false U=false D=false P=false T=false ALL=false NF=false
+  picked read && R=true; picked add && A=true; picked update && U=true; picked delete && D=true
+
+  local rows=() id name
+  rows+=("__all__" "EVERYTHING: every folder and all entries without a folder" "$(st all)")
+  rows+=("__none__" "Entries without a folder" "$(st nofolder)")
+  while IFS=$'\t' read -r id name; do
+    [ -n "$id" ] || continue
+    rows+=("$id" "Folder: $name" "$(jq -r --arg i "$id" 'if (.folderIds | any(. == $i)) then "TRUE" else "FALSE" end' <<<"$cur")")
+  done < <(jq -r '.[] | [.id, .name] | @tsv' <<<"$folders")
+  SEL="$(checklist "$title" "Which parts of the vault may OpenClaw touch?
+
+Pick 'EVERYTHING', or any mix of unfoldered entries and single folders. New entries OpenClaw creates go to the folder $DEFAULT_FOLDER by default." "${rows[@]}")"
+  picked __all__ && ALL=true; picked __none__ && NF=true
+  local ids names
+  ids="$(printf '%s\n' "$SEL" | jq -R . | jq -sc --argjson known "$folders" '[.[] | select(. as $x | $known | any(.id == $x))]')"
+  names="$(jq -nc --argjson ids "$ids" --argjson known "$folders" '[$known[] | select(.id as $i | $ids | any(. == $i)) | .name]')"
+
+  SEL="$(checklist "$title" "What kind of secrets may OpenClaw use?
+
+Authenticator keys are riskier: a code or key that OpenClaw fetches ends up in its chat history." \
+    pwd  "Passwords, usernames, notes, URLs and custom fields" "$(st pwd)" \
+    totp "Authenticator (TOTP) codes and keys" "$(st totp)")"
+  picked pwd && P=true; picked totp && T=true
+
+  local newpol
+  newpol="$(jq -nc --argjson read $R --argjson add $A --argjson update $U --argjson delete $D --argjson pwd $P --argjson totp $T \
+      --argjson all $ALL --argjson nofolder $NF --argjson ids "$ids" --argjson names "$names" \
+      '{read: $read, add: $add, update: $update, delete: $delete, pwd: $pwd, totp: $totp, all: $all, nofolder: $nofolder, folderIds: $ids, folderNames: $names}')"
+  local rc=0
+  ui_ask question "$title" "Save these permissions for OpenClaw?"$'\n\n'"$(policy_text "$newpol")" 300 Save Discard >/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || die "permissions not saved" 6
+  ( umask 077; printf '%s\n' "$newpol" > "$POLICY_FILE.tmp" && mv "$POLICY_FILE.tmp" "$POLICY_FILE" )
+  POLICY=""
+  audit "configure"
+  info "permissions saved:"; policy_text "$newpol" >&2
+}
+
+# ---------- commands: read ----------
+cmd_list() {
+  parse "$@"; gate read; maybe_sync
+  { printf 'NAME\tUSER\tFOLDER\tKEY\n'
+    bwp_env "ONLY_FOLDER=$([ "$FOLDER_SET" -eq 1 ] && printf '%s' "$FOLDER" || true)" "$S_LIST"
+  } | column -t -s $'\t'
+}
+cmd_search() {
+  parse "$@"; need_name; gate read; maybe_sync
+  { printf 'NAME\tUSER\tFOLDER\tKEY\n'; bwp "$S_SEARCH" "$NAME"; } | column -t -s $'\t'
+}
+cmd_fields() {
+  parse "$@"; need_name; gate read pwd; require_item
+  bwp "$S_FIELDS" "$ITEM_ID"
+}
+cmd_user() {
+  parse "$@"; need_name; gate read pwd; require_item
+  bwv 'bw get username "$1"' "$ITEM_ID"; echo
+}
+cmd_code() {
+  parse "$@"; need_name; gate read totp; require_item
+  [ "$ITEM_HAS" = "true" ] || die "'$NAME' has no authenticator key; add one with: bwsafe addkey" 4
+  local code; code="$(bwv 'bw get totp "$1"' "$ITEM_ID")" || die "could not generate a code" 4
+  audit "use:code"
+  printf '%s\n' "$code"
+}
+# Prints the raw secret. Only the bwsafe client calls this (for `run` and `reveal`).
+cmd_secret() {
+  parse "$@"; need_name
+  local f="${FIELD:-password}"
+  if [ "$f" = totp ]; then gate read totp; else gate read pwd; fi
+  require_item
+  if [ "$f" = totp ] && [ "$ITEM_HAS" != "true" ]; then die "'$NAME' has no authenticator key" 4; fi
+  local s; s="$(bwv "$S_GET" "$ITEM_ID" "$f")" || die "could not read '$NAME' (field $f)" 4
+  [ -n "$s" ] || die "entry '$NAME' has an empty $f" 4
+  audit "use:${PURPOSE:-secret}:$f"
+  printf '%s' "$s"
+}
+
+# ---------- commands: add ----------
+cmd_generate() {
+  parse "$@"; need_name; gate add pwd; find_item
+  [ "$ITEM_COUNT" -eq 0 ] || die "an entry named '$NAME'${USER_:+ for $USER_} already exists; generate never overwrites. Pick another NAME or USER, or ask for 'edit' (needs approval)" 7
+  resolve_folder
+  PW=""; SEED=""
+  if [ -n "$WORDS" ]; then
+    [[ "$WORDS" =~ ^[0-9]+$ && "$WORDS" -ge 3 && "$WORDS" -le 20 ]] || die "--words must be 3..20"
+    PW="$(box "" 'bw generate --passphrase --words "$1" --separator -' "$WORDS")" || die "generate failed" 4
+  else
+    LEN="${LEN:-24}"; [[ "$LEN" =~ ^[0-9]+$ && "$LEN" -ge 8 && "$LEN" -le 128 ]] || die "--len must be 8..128"
+    PW="$(box "" 'bw generate -ulns --length "$1"' "$LEN")" || die "generate failed" 4
+  fi
+  [ -n "$PW" ] || die "generate produced nothing" 4
+  create_item; PW=""
+  audit "generate"
+  info "created '$NAME'${USER_:+ (user $USER_)} $([ "$NEWNOFOLDER" -eq 1 ] && printf 'without a folder' || printf 'in folder %s' "$FOLDER") with a random password; stored in the vault, not shown. Use 'bwsafe run' to use it."
+}
+
+cmd_add() {
+  parse "$@"; need_name; gate add pwd; find_item
+  [ "$ITEM_COUNT" -eq 0 ] || die "an entry named '$NAME'${USER_:+ for $USER_} already exists; add never overwrites. Pick another NAME or USER, or ask for 'edit' (needs approval)" 7
+  resolve_folder; read_secret; SEED=""
+  create_item; PW=""
+  audit "add"
+  info "stored '$NAME'${USER_:+ (user $USER_)}; the secret was not shown"
+}
+
+cmd_addkey() {
+  parse "$@"; need_name; gate add totp; read_seed; find_item
+  if [ "$ITEM_COUNT" -gt 1 ]; then die "$ITEM_COUNT entries match '$NAME'; add the USER argument" 4; fi
+  if [ "$ITEM_COUNT" -eq 1 ]; then
+    [ "$ITEM_HAS" = "false" ] || die "'$NAME' already has an authenticator key; replacing it needs approval: use 'setkey'" 7
+    bwv_env "TOTP_SEED=$SEED" "$S_SETKEY" "$ITEM_ID" || die "bw failed" 4
+    audit "add-key:existing-entry"; info "authenticator key attached to existing entry '$NAME'"
+    return 0
+  fi
+  resolve_folder; PW=""
+  create_item
+  audit "add-key:new-entry"; info "created '$NAME'${USER_:+ ($USER_)} with an authenticator key"
+}
+
+# ---------- commands: update / delete (each needs the human's click) ----------
+cmd_edit() {
+  parse "$@"; need_name; gate update pwd; require_item
+  approve "OpenClaw wants to CHANGE the password of: $NAME${USER_:+ ($USER_)}" "edit"
+  read_secret
+  bwv_env "NEW_PW=$PW" "$S_SETPW" "$ITEM_ID" || die "bw failed" 4
+  PW=""; audit "edit"; info "password of '$NAME' replaced; the secret was not shown"
+}
+cmd_setkey() {
+  parse "$@"; need_name; gate update totp; require_item
+  [ "$ITEM_HAS" = "true" ] || die "'$NAME' has no key to replace; use 'addkey'" 4
+  approve "OpenClaw wants to REPLACE the authenticator key of: $NAME${USER_:+ ($USER_)}" "setkey"
+  read_seed
+  bwv_env "TOTP_SEED=$SEED" "$S_SETKEY" "$ITEM_ID" || die "bw failed" 4
+  audit "setkey"; info "authenticator key replaced for '$NAME'"
+}
+cmd_rmkey() {
+  parse "$@"; need_name; gate delete totp; require_item
+  [ "$ITEM_HAS" = "true" ] || die "'$NAME' has no authenticator key" 4
+  approve "OpenClaw wants to REMOVE the authenticator key from: $NAME${USER_:+ ($USER_)}" "rmkey"
+  bwv "$S_CLEARKEY" "$ITEM_ID" || die "bw failed" 4
+  audit "rmkey"; info "authenticator key removed from '$NAME'"
+}
+cmd_remove() {
+  parse "$@"; need_name; gate delete pwd; require_item
+  approve "OpenClaw wants to DELETE the whole entry: $NAME${USER_:+ ($USER_)}"$'\n'"(it goes to the Bitwarden trash)" "remove"
+  bwv 'bw delete item "$1" >/dev/null' "$ITEM_ID" || die "bw failed" 4
+  audit "remove"; info "entry '$NAME' moved to the trash"
+}
+
+cmd_log() {
+  local n="${1:-30}"; [[ "$n" =~ ^[0-9]+$ ]] || die "usage: log [N]"
+  if [ -f "$AUDIT_LOG" ]; then tail -n "$n" "$AUDIT_LOG"; else echo "(no events yet)"; fi
+}
+
+# selftest: prove the sandbox works and really is closed. Installers run this and fail closed.
+# A canary file outside the sandbox's allowed paths must be neither readable nor writable from inside,
+# while bw and jq must run. (Network is only checked loosely: a warning, not a failure.)
+cmd_selftest() {
+  local bad=0 canary="$STATE/selftest-canary" probe="$STATE/selftest-written" out
+  ( umask 077; mkdir -p "$STATE"; printf 'TOKEN-7f3a91\n' > "$canary" )
+  rm -f "$probe"
+  ok()   { printf 'ok   %s\n' "$1"; }
+  fail() { printf 'FAIL %s\n' "$1"; bad=1; }
+  out="$(box "" 'bw --version' 2>&1)" && [ -n "$out" ] && ok "bw runs in the sandbox ($out)" || fail "bw does not run in the sandbox: $out"
+  out="$(box "" 'jq -n "1+1"' 2>&1)" && [ "$out" = 2 ] && ok "jq runs in the sandbox" || fail "jq does not run in the sandbox: $out"
+  out="$(box "" 'cat "$1" 2>&1 && echo LEAK' "$canary" 2>&1 || true)"
+  case "$out" in *LEAK*|*TOKEN-7f3a91*) fail "the sandbox can read files outside its data dir" ;; *) ok "files outside the data dir are unreadable" ;; esac
+  box "" 'echo x > "$1"' "$probe" >/dev/null 2>&1 || true
+  [ -e "$probe" ] && fail "the sandbox can write outside its data dir" || ok "files outside the data dir are unwritable"
+  out="$(box "" 'for d in /Users /home; do ls -A "$d" 2>/dev/null; done | grep -v "^sandbox$" | head -1' 2>&1 || true)"
+  [ -z "$out" ] && ok "no other home directories are visible" || fail "the sandbox can list home directories ($out)"
+  rm -f "$canary" "$probe"
+  if box "" 'curl -sS -m 8 -o /dev/null https://vault.bitwarden.com' >/dev/null 2>&1; then ok "network reachable"; else info "warning: the network check failed (offline, or no curl in the sandbox)"; fi
+  [ "$bad" -eq 0 ] && { info "selftest passed"; return 0; }
+  die "selftest FAILED: do not use this install" 3
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+sub="$1"; shift
+case "$sub" in
+  -h|--help|help) usage ;;
+  status|policy) cmd_status ;;
+  setup) cmd_setup "$@" ;;
+  configure) cmd_configure ;;
+  unlock) cmd_unlock ;;
+  lock) cmd_lock ;;
+  logout) cmd_logout ;;
+  sync) cmd_sync ;;
+  list) cmd_list "$@" ;;
+  search) cmd_search "$@" ;;
+  fields) cmd_fields "$@" ;;
+  user) cmd_user "$@" ;;
+  code|totp) cmd_code "$@" ;;
+  secret) cmd_secret "$@" ;;
+  generate) cmd_generate "$@" ;;
+  add) cmd_add "$@" ;;
+  addkey) cmd_addkey "$@" ;;
+  edit) cmd_edit "$@" ;;
+  setkey) cmd_setkey "$@" ;;
+  rmkey) cmd_rmkey "$@" ;;
+  remove) cmd_remove "$@" ;;
+  log) cmd_log "$@" ;;
+  selftest) cmd_selftest ;;
+  *) usage >&2; die "unknown command: $sub" ;;
+esac

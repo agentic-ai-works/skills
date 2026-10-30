@@ -1,0 +1,58 @@
+;; bwsafe Seatbelt profile (macOS). UNTESTED on a real Mac: the installer runs `bwsafe selftest`
+;; and refuses to finish if this profile does not work or does not hold.
+;; Used as: sandbox-exec -f bwsafe.sb -D DATA=.. -D TMPD=.. -D BW=.. -D JQ=.. -D JQDIR=.. -D EXTRACA=.. CMD
+;; bw (a Node program) may run, read system libraries and the certificate list, write only its data
+;; dir and a private temp dir, and use the network. Nothing else: no home, no other users' files.
+(version 1)
+(deny default)
+(import "system.sb")
+
+(allow process-fork)
+(allow process-exec
+  (literal (param "BW"))
+  (literal (param "JQ"))
+  (literal "/bin/sh")
+  (literal "/usr/bin/env")
+  (subpath "/usr/bin")
+  (subpath "/bin"))
+
+;; Homebrew (jq's own libraries live there on a Mac with Homebrew); read-only, holds no secrets
+(allow file-read* (subpath "/opt/homebrew") (subpath "/usr/local/Cellar") (subpath "/usr/local/opt") (subpath "/usr/local/lib"))
+
+;; read-only: system libraries, certificates, resolver config, the CLI binaries
+(allow file-read*
+  (subpath "/usr/lib")
+  (subpath "/usr/share")
+  (subpath "/System")
+  (subpath "/Library/Frameworks")
+  (subpath "/private/etc/ssl")
+  (literal "/private/etc/hosts")
+  (literal "/private/etc/resolv.conf")
+  (literal "/private/etc/passwd")
+  (subpath "/dev")
+  (literal (param "BW"))
+  (literal (param "JQ"))
+  (subpath (param "JQDIR"))
+  (subpath "/usr/bin")
+  (subpath "/bin"))
+(allow file-read* (literal (param "EXTRACA")))      ; a certificate the human chose to trust, if any
+
+;; the only writable places
+(allow file-read* file-write*
+  (subpath (param "DATA"))
+  (subpath (param "TMPD")))
+(allow file-write* (literal "/dev/null") (literal "/dev/dtracehelper"))
+
+;; the network, and the system services TLS and DNS need
+(allow network-outbound)
+(allow system-socket)
+(allow sysctl-read)
+(allow mach-lookup
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.trustd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.ocspd"))

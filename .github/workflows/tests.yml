@@ -1,0 +1,21 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap jq zenity python3
+      - run: bash bitwarden/tests/offline-test.sh
+      - run: bash bitwarden/tests/helper-test.sh
+      - run: bash bitwarden/tests/macos-static-test.sh
+      - run: bash bitwarden/install/install.sh --verify-only
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install bash jq
+      - run: bash bitwarden/tests/macos-static-test.sh
+      - run: bash bitwarden/tests/helper-test.sh
