@@ -80,6 +80,7 @@ kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 OTHER="$(getent passwd | awk -F: -v me="$(id -un)" '$1!=me && $3>0 && $3<65000 {print $1; exit}')"
 [ -z "$OTHER" ] && OTHER=root
 [ "$OTHER" = "$(id -un)" ] && OTHER=nobody
+rm -f "$SOCK"   # the killed server leaves its socket file behind; wait for the new one
 $PY "$UI" serve "$SOCK" --allow "$OTHER" & SRV=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SOCK" ] && break; sleep 0.3; done
 : > "$T/osa.log"
