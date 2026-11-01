@@ -20,7 +20,7 @@ else
   INSTALLER=install.sh
 fi
 if [ ! -x "$CORE" ]; then
-  echo "bwsafe: not installed. Jens must run once (a dialog explains it first): bash $(cd "$(dirname "$0")" && pwd)/../install/$INSTALLER" >&2
+  echo "bwsafe: not installed. The account owner must run once (a dialog explains it first): bash $(cd "$(dirname "$0")" && pwd)/../install/$INSTALLER" >&2
   exit 3
 fi
 die() { echo "bwsafe: $1" >&2; exit "${2:-2}"; }
